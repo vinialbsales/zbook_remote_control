@@ -1,0 +1,17 @@
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+    - name: zephyr-book
+      url-base: https://github.com/zephyr-book
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: 03b0b5443c7a760745826cc53c40e1986d753f86
+      import: true
+    - name: zbook
+      remote: zephyr-book
+      revision: 530df5dc6e51823b0eafb1f639ce86da6029fa8f
+      path: modules/zbook
+  self:
+    path: zbook_remote_control

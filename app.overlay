@@ -1,0 +1,45 @@
+/* Emissor IR no GPIO6 via PWM (slice 3, canal A) para gerar 38 kHz.
+ * Vale para a ZBook P2. */
+
+/* O GPIO6 deixa de ser um LED comum e passa a ser controlado pelo PWM. */
+/delete-node/ &ir_emitter;
+
+/* Conecta o GPIO6 ao PWM, mantendo os pinos que a placa ja usava. */
+&pwm_default {
+	group1 {
+		pinmux = <PWM_3A_P6>, <PWM_3B_P7>, <PWM_8A_P32>;
+	};
+};
+
+/* Divisor 1 no slice 3: o contador anda a 150 MHz, o que da
+ * resolucao fina para os 38 kHz. */
+&pwm {
+	divider-int-3 = <1>;
+};
+
+/* Configuracao do pino do receptor (GPIO47). Variacoes testadas na
+ * Parte A: sem pull, GPIO_PULL_UP e GPIO_PULL_DOWN. */
+&ir_receiver {
+	gpios = <&gpio0_hi 15 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+};
+
+/ {
+	/* Propriedades proprias da aplicacao, lidas no main.c com DT_PROP.
+	 * ir-hysteresis: 1 liga o schmitt trigger do pino do receptor (padrao
+	 * do RP2350), 0 desliga. O driver GPIO do Zephyr nao tem flag para
+	 * isso, entao o main.c aplica o valor pelo Pico SDK. Desligada, a
+	 * borda lenta do receptor gera bordas espurias e nenhum toque foi
+	 * capturado; por isso fica ligada. */
+	zephyr,user {
+		ir-hysteresis = <1>;
+	};
+
+	ir_tx {
+		compatible = "pwm-leds";
+
+		/* Canal 6 = slice 3, canal A (GPIO6). Periodo de 26316 ns = 38 kHz. */
+		ir_carrier: ir_carrier {
+			pwms = <&pwm 6 PWM_NSEC(26316) PWM_POLARITY_NORMAL>;
+		};
+	};
+};

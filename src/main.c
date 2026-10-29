@@ -1,6 +1,5 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
-#include <zephyr/input/input.h>
 #include <zephyr/kernel.h>
 
 /* API do Pico SDK (hal_rpi_pico), usada so para a histerese do pino,
@@ -9,6 +8,7 @@
 #include <hardware/structs/pads_bank0.h>
 
 #include "ir_decode.h"
+#include "ui.h"
 
 #define MAX_EDGES 200
 
@@ -42,8 +42,9 @@ static volatile uint32_t last_edge;
 static uint32_t copy[MAX_EDGES];
 static uint32_t durations[MAX_EDGES];
 
-/* Ultimo codigo gravado. So o protocolo e o codigo sao guardados; os
- * tempos sao remontados na hora de enviar. */
+/* Ultimo codigo aceito, usado para reconhecer os outros quadros do mesmo
+ * toque. Os codigos de cada slot ficam no ui.c; so o protocolo e o codigo
+ * sao guardados, e os tempos sao remontados na hora de enviar. */
 static struct ir_code saved;
 static bool has_saved;
 static uint32_t last_accept_ms;
@@ -63,9 +64,6 @@ static const char *warn_reason;
 /* Transmissao montada a partir do codigo gravado. */
 static uint32_t tx_buf[IR_ENCODE_MAX];
 
-/* Sinalizado quando o BUTTON0 e apertado. */
-K_SEM_DEFINE(tx_sem, 0, 1);
-
 static void on_edge(const struct device *dev, struct gpio_callback *cb,
                     uint32_t pins) {
   uint32_t now = k_cycle_get_32();
@@ -75,15 +73,6 @@ static void on_edge(const struct device *dev, struct gpio_callback *cb,
   }
   last_edge = now;
 }
-
-/* Chamado pelo subsistema de entrada a cada evento de botao/encoder. */
-static void on_input(struct input_event *evt, void *user_data) {
-  if (evt->type == INPUT_EV_KEY && evt->code == INPUT_BTN_0 &&
-      evt->value == 1) {
-    k_sem_give(&tx_sem);
-  }
-}
-INPUT_CALLBACK_DEFINE(NULL, on_input, NULL);
 
 /* Reproduz um sinal: nos pulsos liga a portadora (duty ~1/3),
  * nos espacos desliga. */
@@ -143,6 +132,25 @@ static int take_capture(uint32_t *out) {
   return n;
 }
 
+/* Envia o codigo de um slot gravado, com "Enviando..." na tela. */
+static void send_slot(int slot) {
+  const struct ir_code *code = ui_slot_code(slot);
+
+  if (code == NULL) {
+    return;
+  }
+  int n = ir_encode(code, tx_buf, IR_ENCODE_MAX);
+
+  printk("Enviando %s 0x%08X...\n", ir_protocol_name(code->protocol),
+         code->code);
+  /* ir_send trava o escalonador, entao a tela e desenhada antes. */
+  ui_set_sending(slot);
+  ui_draw();
+  ir_send(tx_buf, n);
+  ui_set_sending(-1);
+  printk("Enviado\n\n");
+}
+
 static void print_durations(const uint32_t *dur, int n) {
   printk("Bruto: %d intervalos\n", n);
   for (int i = 0; i < n; i++) {
@@ -200,8 +208,9 @@ static void on_code(const struct ir_code *code, int lost_pulses,
   saved = *code;
   has_saved = true;
   last_accept_ms = now;
-  printk("Gravado: %s 0x%08X\n\n", ir_protocol_name(code->protocol),
+  printk("Gravado: %s 0x%08X\n", ir_protocol_name(code->protocol),
          code->code);
+  ui_record_code(code);
 }
 
 static void handle_capture(int n_edges_copied) {
@@ -272,25 +281,32 @@ int main(void) {
   gpio_init_callback(&ir_cb, on_edge, BIT(ir.pin));
   gpio_add_callback(ir.port, &ir_cb);
 
+  if (ui_init() < 0) {
+    printk("Display nao esta pronto; seguindo sem tela\n");
+  }
+  ui_draw();
+
   print_receiver_config();
-  printk("Aponte um controle e aperte um botao para gravar.\n");
-  printk("Aperte BUTTON0 para reenviar o ultimo codigo gravado.\n\n");
+  printk("Gire o encoder para escolher um slot. Clique envia; segure\n"
+         "0,8 s para gravar. BUTTON0..3 enviam os slots 1..4.\n\n");
 
   while (1) {
-    /* Espera ate 10 ms pelo botao; se nao vier, segue pra captura. */
-    if (k_sem_take(&tx_sem, K_MSEC(10)) == 0) {
-      if (!has_saved) {
-        printk("Nada gravado ainda\n");
-        continue;
-      }
-      int n = ir_encode(&saved, tx_buf, IR_ENCODE_MAX);
+    struct ui_event evt;
 
-      printk("Enviando %s 0x%08X...\n", ir_protocol_name(saved.protocol),
-             saved.code);
-      ir_send(tx_buf, n);
-      printk("Enviado\n\n");
-      continue;
+    /* Espera ate 10 ms por um evento de entrada; o timeout faz o papel do
+     * tick que verifica a captura. Depois esvazia o que mais tiver na
+     * fila, para girar rapido nao gerar um redesenho por clique. */
+    if (k_msgq_get(&ui_msgq, &evt, K_MSEC(10)) == 0) {
+      do {
+        int slot = ui_handle_event(&evt);
+
+        if (slot >= 0) {
+          send_slot(slot);
+        }
+      } while (k_msgq_get(&ui_msgq, &evt, K_NO_WAIT) == 0);
     }
+    ui_tick();
+    ui_draw();
 
     if (warn_pending &&
         k_uptime_get_32() - warn_ms >= REPEAT_WINDOW_MS) {
@@ -298,10 +314,17 @@ int main(void) {
       printk("Aviso: sinal nao reconhecido (%s); nada foi gravado.\n"
              "Tente de novo com o controle a uns 30 cm a 1 m da placa.\n\n",
              warn_reason);
+      ui_record_failed();
     }
 
+    /* A captura sempre e retirada do buffer, mas so e decodificada no
+     * modo gravar. Fora dele, nada pendente de uma gravacao anterior
+     * (leitura sem confirmacao, aviso adiado) pode valer depois. */
     int n = take_capture(copy);
-    if (n >= 2) {
+    if (!ui_is_recording()) {
+      has_pending = false;
+      warn_pending = false;
+    } else if (n >= 2) {
       handle_capture(n);
     }
   }

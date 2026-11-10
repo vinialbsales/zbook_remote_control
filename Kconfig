@@ -1,0 +1,17 @@
+# Opcoes proprias do app. O resto do Kconfig vem do Zephyr.
+
+mainmenu "zbook remote control"
+
+config APP_IR_DEBUG
+	bool "Imprimir toda captura IR no console"
+	help
+	  Imprime cada captura do receptor, dentro ou fora do modo gravar:
+	  instante da primeira borda, intervalo desde a captura anterior,
+	  duracoes brutas e o resultado de cada quadro decodificado
+	  separadamente, com o tempo de decodificacao na placa.
+	  Serve para diagnosticar controles que mandam varios quadros por
+	  toque. A 115200 baud, a impressao trava o main por ~25 ms numa
+	  captura tipica e ate ~130 ms numa de 200 bordas. Desligada, o
+	  codigo nao vai para o binario.
+
+source "Kconfig.zephyr"

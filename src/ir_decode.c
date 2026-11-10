@@ -104,6 +104,15 @@ static const struct protocol_timing timings[] = {
     {IR_PROTO_NEC, 9000, 4500},
 };
 
+/* Coolix (IRremoteESP8266, ir_Coolix.cpp): tick de 276 us. */
+#define COOLIX_HDR_PULSE 4692
+#define COOLIX_HDR_SPACE 4416
+#define COOLIX_BIT_PULSE 552
+#define COOLIX_SPACE_1 1656
+#define COOLIX_SPACE_0 552
+#define COOLIX_GAP 5244 /* entre os dois quadros */
+#define COOLIX_BITS 24
+
 /* Codigo de repeticao do NEC: 9000 + 2250 + 560. */
 #define NEC_REPEAT_PULSE 9000
 #define NEC_REPEAT_SPACE 2250
@@ -227,6 +236,9 @@ int ir_code_is_valid(enum ir_protocol protocol, uint32_t code) {
   uint8_t b4 = (uint8_t)code;
 
   switch (protocol) {
+  case IR_PROTO_COOLIX:
+    /* 24 bits; o nibble de cima e sempre 0xB. */
+    return (code >> 24) == 0 && (code >> 20) == 0xB;
   case IR_PROTO_SAMSUNG32:
     /* Endereco repetido nos bytes 1 e 2; comando e seu inverso. */
     return b1 == b2 && b4 == (uint8_t)~b3;
@@ -490,15 +502,93 @@ static int put_frame(const struct protocol_timing *t, uint32_t code,
   return pos;
 }
 
+/* Tempos do protocolo, ou NULL se ele nao e conhecido. */
+static const struct protocol_timing *find_timing(enum ir_protocol protocol) {
+  for (size_t p = 0; p < sizeof(timings) / sizeof(timings[0]); p++) {
+    if (timings[p].protocol == protocol) {
+      return &timings[p];
+    }
+  }
+  return NULL;
+}
+
+/* Quadro Coolix: cada byte do estado (MSB primeiro) e depois o inverso. */
+static int put_coolix(uint32_t state, uint32_t *dur, int max) {
+  int pos = 0;
+
+  if (max < IR_COOLIX_FRAME_LEN) {
+    return 0;
+  }
+  dur[pos++] = COOLIX_HDR_PULSE;
+  dur[pos++] = COOLIX_HDR_SPACE;
+  for (int byte = 2; byte >= 0; byte--) {
+    uint8_t v = (uint8_t)(state >> (8 * byte));
+
+    for (int inv = 0; inv < 2; inv++) {
+      uint8_t b = inv ? (uint8_t)~v : v;
+
+      for (int i = 7; i >= 0; i--) {
+        dur[pos++] = COOLIX_BIT_PULSE;
+        dur[pos++] = (b >> i) & 1 ? COOLIX_SPACE_1 : COOLIX_SPACE_0;
+      }
+    }
+  }
+  dur[pos++] = COOLIX_BIT_PULSE;
+  return pos;
+}
+
+int ir_encode_frame(const struct ir_code *code, uint32_t *dur, int max) {
+  const struct protocol_timing *t = find_timing(code->protocol);
+  uint32_t elapsed = 0;
+
+  if (code->protocol == IR_PROTO_COOLIX) {
+    return put_coolix(code->code, dur, max);
+  }
+  if (t == NULL) {
+    return 0;
+  }
+  return put_frame(t, code->code, dur, 0, max, &elapsed) < 0 ? 0
+                                                             : IR_FRAME_LEN;
+}
+
+uint32_t ir_frame_duration_us(const struct ir_code *code) {
+  const struct protocol_timing *t = find_timing(code->protocol);
+  uint32_t total;
+
+  if (code->protocol == IR_PROTO_COOLIX) {
+    uint32_t buf[IR_COOLIX_FRAME_LEN];
+    int n = put_coolix(code->code, buf, IR_COOLIX_FRAME_LEN);
+
+    total = 0;
+    for (int i = 0; i < n; i++) {
+      total += buf[i];
+    }
+    return total;
+  }
+  if (t == NULL) {
+    return 0;
+  }
+  total = t->header_pulse + t->header_space + BIT_PULSE;
+  for (int i = 0; i < FRAME_BITS; i++) {
+    total += (code->code >> i) & 1 ? PERIOD_1 : PERIOD_0;
+  }
+  return total;
+}
+
 int ir_encode(const struct ir_code *code, uint32_t *dur, int max) {
-  const struct protocol_timing *t = NULL;
+  const struct protocol_timing *t = find_timing(code->protocol);
   uint32_t elapsed = 0;
   int pos;
 
-  for (size_t p = 0; p < sizeof(timings) / sizeof(timings[0]); p++) {
-    if (timings[p].protocol == code->protocol) {
-      t = &timings[p];
+  /* Coolix: o controle manda o quadro duas vezes, 5,2 ms de intervalo. */
+  if (code->protocol == IR_PROTO_COOLIX) {
+    int n = put_coolix(code->code, dur, max);
+
+    if (n == 0 || n + 1 + IR_COOLIX_FRAME_LEN > max) {
+      return 0;
     }
+    dur[n] = COOLIX_GAP;
+    return n + 1 + put_coolix(code->code, dur + n + 1, max - n - 1);
   }
   if (t == NULL) {
     return 0;
@@ -533,6 +623,8 @@ const char *ir_protocol_name(enum ir_protocol protocol) {
     return "NEC";
   case IR_PROTO_SAMSUNG32:
     return "Samsung32";
+  case IR_PROTO_COOLIX:
+    return "Coolix";
   default:
     return "nenhum";
   }

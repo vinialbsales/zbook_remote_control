@@ -1,3 +1,5 @@
+#include <string.h>
+
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/kernel.h>
@@ -8,18 +10,24 @@
 #include <hardware/structs/pads_bank0.h>
 
 #include "ir_decode.h"
+#include "ir_edges.h"
+#include "ir_seq.h"
+#include "slot_store.h"
 #include "ui.h"
 
-#define MAX_EDGES 200
+/* Bordas por captura. Um quadro NEC tem 68; ar-condicionado chega a
+ * centenas (gravacao crua). */
+#define MAX_EDGES IR_RAW_MAX
+
+/* Mais quadros que isso numa captura sao ignorados (MAX_EDGES cabe ~3). */
+#define MAX_FRAMES 8
 
 /* Silencio que encerra uma captura. Menor que o intervalo entre os
  * quadros de um toque (~46 ms), para cada quadro chegar separado. */
 #define END_OF_CAPTURE_MS 20
 
-/* Quadros do mesmo codigo dentro dessa janela sao o mesmo toque. */
-#define REPEAT_WINDOW_MS 200
-
-/* 1 imprime as duracoes brutas de cada captura (util para depurar). */
+/* 1 imprime as duracoes brutas de cada captura no modo gravar. Com
+ * CONFIG_APP_IR_DEBUG, elas saem sempre, na impressao de depuracao. */
 #define PRINT_RAW 1
 
 /* Histerese (schmitt trigger) do pino do receptor, escolhida no
@@ -35,42 +43,42 @@ static const struct pwm_dt_spec carrier =
     PWM_DT_SPEC_GET(DT_NODELABEL(ir_carrier));
 static struct gpio_callback ir_cb;
 
-/* Captura: preenchido pela interrupcao. */
+/* Captura: preenchido pela interrupcao, pelo filtro do ir_edges.h, que
+ * le o nivel do pino e apaga os intervalos da portadora. */
 static volatile uint32_t edges[MAX_EDGES];
-static volatile int n_edges;
+static struct ir_edges cap = {.t = edges, .max = MAX_EDGES};
 static volatile uint32_t last_edge;
+static uint32_t ir_pin; /* numero absoluto do pino (GPIO47) */
 static uint32_t copy[MAX_EDGES];
 static uint32_t durations[MAX_EDGES];
 
-/* Ultimo codigo aceito, usado para reconhecer os outros quadros do mesmo
- * toque. Os codigos de cada slot ficam no ui.c; so o protocolo e o codigo
- * sao guardados, e os tempos sao remontados na hora de enviar. */
-static struct ir_code saved;
-static bool has_saved;
-static uint32_t last_accept_ms;
+/* Junta os quadros de um toque numa sequencia (ir_seq.c). So os codigos
+ * vao para os slots; os tempos sao remontados na hora de enviar. */
+static struct ir_recorder rec;
 
-/* Leitura que supos pulsos perdidos: so e gravada se outro quadro do
- * mesmo toque der o mesmo codigo. */
-static struct ir_code pending;
-static bool has_pending;
-static uint32_t pending_ms;
+/* Transmissao montada a partir da sequencia ou da gravacao crua. */
+#define TX_MAX (IR_SEQ_TX_MAX > IR_RAW_MAX ? IR_SEQ_TX_MAX : IR_RAW_MAX)
+static uint32_t tx_buf[TX_MAX];
 
-/* Aviso de falha adiado: se outro quadro do mesmo toque decodificar
- * logo em seguida, o aviso e cancelado. */
-static bool warn_pending;
-static uint32_t warn_ms;
-static const char *warn_reason;
+/* Copia da gravacao crua pronta (grande demais para a pilha). */
+static struct ir_raw raw_done;
 
-/* Transmissao montada a partir do codigo gravado. */
-static uint32_t tx_buf[IR_ENCODE_MAX];
+/* Resultado de um quadro, guardado para a impressao de depuracao. */
+struct frame_result {
+  struct ir_span span;
+  enum ir_status status;
+  struct ir_code code;
+  struct ir_decode_info info;
+  uint32_t t_us;      /* inicio do quadro (primeira borda) */
+  uint32_t decode_us; /* tempo do ir_decode_frame na placa */
+};
 
 static void on_edge(const struct device *dev, struct gpio_callback *cb,
                     uint32_t pins) {
   uint32_t now = k_cycle_get_32();
 
-  if (n_edges < MAX_EDGES) {
-    edges[n_edges++] = now;
-  }
+  /* Leitura direta do SIO (inline, poucos ciclos). */
+  ir_edges_on_edge(&cap, now, gpio_get(ir_pin));
   last_edge = now;
 }
 
@@ -102,7 +110,7 @@ static void ir_send(const uint32_t *dur_us, int count) {
 
   /* Descarta o que tiver sido capturado e volta a escutar. */
   k_msleep(50);
-  n_edges = 0;
+  cap.n = 0;
   gpio_pin_interrupt_configure_dt(&ir, GPIO_INT_EDGE_BOTH);
 }
 
@@ -121,28 +129,77 @@ static int take_capture(uint32_t *out) {
   unsigned int key = irq_lock();
   uint32_t idle = k_cycle_get_32() - last_edge;
 
-  if (n_edges > 0 && k_cyc_to_ms_floor32(idle) >= END_OF_CAPTURE_MS) {
-    n = n_edges;
+  if (cap.n > 0 && k_cyc_to_ms_floor32(idle) >= END_OF_CAPTURE_MS) {
+    n = cap.n;
     for (int i = 0; i < n; i++) {
       out[i] = edges[i];
     }
-    n_edges = 0;
+    cap.n = 0;
   }
   irq_unlock(key);
   return n;
 }
 
-/* Envia o codigo de um slot gravado, com "Enviando..." na tela. */
-static void send_slot(int slot) {
-  const struct ir_code *code = ui_slot_code(slot);
+/* Relogio do gravador: us de 32 bits, tirado do contador de ciclos de
+ * 64 bits (da a volta a cada ~71 min, sem salto). */
+static uint32_t now_us(void) {
+  return (uint32_t)k_cyc_to_us_floor64(k_cycle_get_64());
+}
 
-  if (code == NULL) {
+/* Instante de uma borda no relogio do gravador. A interrupcao guarda so
+ * os 32 bits de baixo do contador (que da a volta a cada ~28 s); a idade
+ * da borda, medida contra o mesmo "agora", reconstroi os 64 bits. Assim
+ * vale o horario em que o sinal chegou, nao a hora em que o main viu a
+ * captura (que atrasa com o desenho da tela ou um printk). */
+static uint32_t edge_time_us(uint32_t edge_cyc, uint64_t now_cyc) {
+  uint32_t age = (uint32_t)now_cyc - edge_cyc;
+
+  return (uint32_t)k_cyc_to_us_floor64(now_cyc - age);
+}
+
+/* Envia a sequencia de um slot gravado, com "Enviando..." na tela. */
+static void send_slot(int slot) {
+  const struct ir_seq *seq = ui_slot_sequence(slot);
+  const uint16_t *raw;
+  int raw_n = ui_slot_raw(slot, &raw);
+
+  if (raw_n > 0 && raw_n <= (int)ARRAY_SIZE(tx_buf)) {
+    uint32_t total = 0;
+
+    for (int i = 0; i < raw_n; i++) {
+      tx_buf[i] = raw[i];
+      total += raw[i];
+    }
+    printk("Enviando \"%s / %s\" (%s, %d intervalos, %u ms)\n",
+           ui_device_name(ui_device()), ui_slot_name(slot),
+           ui_slot_source(slot) == UI_SRC_RECORDED ? "gravacao crua"
+                                                   : "de fabrica",
+           raw_n, total / 1000);
+    ui_set_sending(slot);
+    ui_draw();
+    ir_send(tx_buf, raw_n);
+    ui_set_sending(-1);
+    printk("Enviado\n\n");
     return;
   }
-  int n = ir_encode(code, tx_buf, IR_ENCODE_MAX);
+  if (seq == NULL) {
+    return;
+  }
+  int n = ir_seq_encode(seq, tx_buf, ARRAY_SIZE(tx_buf));
 
-  printk("Enviando %s 0x%08X...\n", ir_protocol_name(code->protocol),
-         code->code);
+  if (n == 0) {
+    printk("Slot \"%s\": sequencia invalida, nada enviado\n",
+           ui_slot_name(slot));
+    return;
+  }
+  printk("Enviando \"%s / %s\" (%s, %d codigo(s)):\n",
+         ui_device_name(ui_device()), ui_slot_name(slot),
+         ui_slot_source(slot) == UI_SRC_RECORDED ? "gravado" : "de fabrica",
+         seq->count);
+  for (int i = 0; i < seq->count; i++) {
+    printk("  %s 0x%08X (+%u us)\n", ir_protocol_name(seq->codes[i].protocol),
+           seq->codes[i].code, seq->gap_us[i]);
+  }
   /* ir_send trava o escalonador, entao a tela e desenhada antes. */
   ui_set_sending(slot);
   ui_draw();
@@ -162,87 +219,272 @@ static void print_durations(const uint32_t *dur, int n) {
   printk("\n");
 }
 
-static bool same_code(const struct ir_code *a, const struct ir_code *b) {
-  return a->protocol == b->protocol && a->code == b->code;
-}
+/* Mostra no console o que o gravador fez com um quadro. */
+static void report_frame(const struct frame_result *f,
+                         enum ir_rec_result r) {
+  const struct ir_seq *seq = &rec.seq;
 
-/* true se um codigo foi aceito ha pouco (este quadro e do mesmo toque). */
-static bool recently_accepted(uint32_t now) {
-  return has_saved && now - last_accept_ms < REPEAT_WINDOW_MS;
-}
-
-static void schedule_warning(const char *reason, uint32_t now) {
-  if (recently_accepted(now)) {
-    return;
+  switch (r) {
+  case IR_REC_ADDED:
+    printk("Gravado: %s 0x%08X (codigo %d, +%u us)\n",
+           ir_protocol_name(f->code.protocol), f->code.code, seq->count,
+           seq->gap_us[seq->count - 1]);
+    break;
+  case IR_REC_PENDING:
+    printk("Quadro %s 0x%08X com pulso perdido: esperando confirmacao\n",
+           ir_protocol_name(f->code.protocol), f->code.code);
+    break;
+  case IR_REC_CYCLE:
+    printk("Codigo 0x%08X ja esta na sequencia (controle recomecou): "
+           "ignorado\n", f->code.code);
+    break;
+  case IR_REC_FULL:
+    printk("Sequencia cheia (%d codigos): 0x%08X ignorado\n", IR_SEQ_MAX,
+           f->code.code);
+    break;
+  case IR_REC_LATE:
+    printk("Quadro 0x%08X comecou depois da janela: ignorado\n",
+           f->code.code);
+    break;
+  case IR_REC_REJECTED:
+    printk("Quadro rejeitado: %s\n", ir_status_name(f->status));
+    break;
+  case IR_REC_SAME:
+  case IR_REC_REPEAT:
+    break;
   }
-  warn_pending = true;
-  warn_ms = now;
-  warn_reason = reason;
 }
 
-/* Trata um quadro decodificado com sucesso. */
-static void on_code(const struct ir_code *code, int lost_pulses,
-                    uint32_t now) {
-  if (lost_pulses > 0) {
-    bool confirmed = (has_pending && same_code(&pending, code) &&
-                      now - pending_ms < REPEAT_WINDOW_MS) ||
-                     (recently_accepted(now) && same_code(&saved, code));
+/* Impressao de depuracao de toda captura, com ou sem modo gravar
+ * (CONFIG_APP_IR_DEBUG). Feita depois do gravador, para nao atrasar
+ * nada que dependa de tempo; o gravador usa o horario das bordas. */
+static void debug_capture(int n_edges_copied, int n, const struct frame_result *fr,
+                          int frames, uint32_t t0_us) {
+  static uint32_t count;
+  static uint32_t prev_t0_us;
+  static uint32_t prev_end_us;
+  uint32_t end_us = t0_us + k_cyc_to_us_floor32(copy[n_edges_copied - 1] - copy[0]);
 
-    if (!confirmed) {
-      pending = *code;
-      pending_ms = now;
-      has_pending = true;
-      schedule_warning("sinal fraco e sem confirmacao", now);
-      return;
+  count++;
+  printk("== IR captura %u: t=%u ms", count, t0_us / 1000);
+  if (count > 1) {
+    printk(", +%u ms desde a anterior (silencio %u ms)",
+           (t0_us - prev_t0_us) / 1000, (t0_us - prev_end_us) / 1000);
+  }
+  printk(", modo gravar: %s\n", ui_is_recording() ? "sim" : "nao");
+  printk("Limite MAX_EDGES (%d bordas): %s\n", MAX_EDGES,
+         n_edges_copied >= MAX_EDGES ? "SIM, captura cortada" : "nao");
+  printk("Filtro: %u espacos de portadora apagados, %u bordas fora de "
+         "ordem ignoradas (desde a partida)\n", cap.merged, cap.ignored);
+  prev_t0_us = t0_us;
+  prev_end_us = end_us;
+
+  print_durations(durations, n);
+  for (int f = 0; f < frames; f++) {
+    const struct frame_result *r = &fr[f];
+
+    printk("quadro %d: %d intervalos, +%u us: ", f + 1, r->span.len,
+           r->t_us - t0_us);
+    if (r->status == IR_OK) {
+      printk("%s 0x%08X, esticamento %d us (%d a %d), pulsos perdidos %d",
+             ir_protocol_name(r->code.protocol), r->code.code,
+             r->info.stretch_avg_us, r->info.stretch_min_us,
+             r->info.stretch_max_us, r->info.lost_pulses);
+      printk(", %d passos", r->info.search_steps);
+    } else {
+      printk("%s", ir_status_name(r->status));
     }
+    printk(", decodificado em %u us\n", r->decode_us);
   }
-  has_pending = false;
-  warn_pending = false;
-
-  /* Segundo quadro do mesmo toque, ou botao segurado. */
-  if (recently_accepted(now) && same_code(&saved, code)) {
-    last_accept_ms = now;
-    return;
-  }
-
-  saved = *code;
-  has_saved = true;
-  last_accept_ms = now;
-  printk("Gravado: %s 0x%08X\n", ir_protocol_name(code->protocol),
-         code->code);
-  ui_record_code(code);
+  printk("\n");
 }
 
+/* Separa a captura em quadros, decodifica cada um e entrega ao gravador.
+ * O ir_decode para no primeiro quadro valido; aqui cada quadro conta,
+ * porque se o main atrasar dois codigos diferentes podem cair na mesma
+ * captura. */
 static void handle_capture(int n_edges_copied) {
+  static struct frame_result fr[MAX_FRAMES];
+  struct ir_span spans[MAX_FRAMES];
   int n = n_edges_copied - 1;
-  struct ir_code code;
-  struct ir_decode_info info;
-  uint32_t now = k_uptime_get_32();
+  uint64_t now_cyc = k_cycle_get_64();
+  bool recording = ui_is_recording();
+  bool debug = IS_ENABLED(CONFIG_APP_IR_DEBUG);
+
+  if (!recording && !debug) {
+    return;
+  }
 
   /* Converte instantes em duracoes: pulso, espaco, pulso... */
   for (int i = 0; i < n; i++) {
     durations[i] = k_cyc_to_us_floor32(copy[i + 1] - copy[i]);
   }
-  if (PRINT_RAW) {
+  if (PRINT_RAW && recording && !debug) {
     print_durations(durations, n);
   }
 
-  enum ir_status st = ir_decode(durations, n, &code, &info);
+  int frames = ir_split_frames(durations, n, spans, MAX_FRAMES);
 
-  if (st == IR_OK) {
-    printk("Quadro: %s 0x%08X, esticamento %d us (%d a %d), "
-           "pulsos perdidos %d\n",
-           ir_protocol_name(code.protocol), code.code, info.stretch_avg_us,
-           info.stretch_min_us, info.stretch_max_us, info.lost_pulses);
-    on_code(&code, info.lost_pulses, now);
-  } else if (st == IR_REPEAT) {
-    /* Botao NEC segurado: so prolonga a janela de repeticao. */
-    if (recently_accepted(now)) {
-      last_accept_ms = now;
+  for (int f = 0; f < frames; f++) {
+    struct frame_result *r = &fr[f];
+    uint32_t c0 = k_cycle_get_32();
+
+    r->span = spans[f];
+    r->status = ir_decode_frame(durations + spans[f].start, spans[f].len,
+                                &r->code, &r->info);
+    r->decode_us = k_cyc_to_us_floor32(k_cycle_get_32() - c0);
+    /* durations[i] comeca na borda copy[i]. */
+    r->t_us = edge_time_us(copy[spans[f].start], now_cyc);
+
+    if (recording) {
+      enum ir_rec_result res = ir_rec_frame(
+          &rec, r->status, &r->code,
+          r->status == IR_OK ? r->info.lost_pulses : 0, r->t_us);
+
+      if (!debug && r->status == IR_OK) {
+        printk("Quadro: %s 0x%08X, esticamento %d us (%d a %d), "
+               "pulsos perdidos %d\n",
+               ir_protocol_name(r->code.protocol), r->code.code,
+               r->info.stretch_avg_us, r->info.stretch_min_us,
+               r->info.stretch_max_us, r->info.lost_pulses);
+      }
+      report_frame(r, res);
     }
-  } else {
-    printk("Quadro rejeitado: %s\n", ir_status_name(st));
-    schedule_warning(ir_status_name(st), now);
+  }
+
+  /* A captura inteira vai para a gravacao crua, que so vale se nenhum
+   * codigo for reconhecido no toque. */
+  if (recording) {
+    ir_rec_capture(&rec, durations, n, edge_time_us(copy[0], now_cyc),
+                   n_edges_copied >= MAX_EDGES);
+  }
+  if (debug) {
+    debug_capture(n_edges_copied, n, fr, frames,
+                  edge_time_us(copy[0], now_cyc));
+  }
+}
+
+/* Confere o gravador: aviso de falha adiado e fim da janela. */
+static void poll_recorder(void) {
+  struct ir_seq seq;
+  bool suspect = false;
+
+  switch (ir_rec_poll(&rec, now_us(), &seq, &suspect)) {
+  case IR_REC_POLL_WARN:
+    printk("Aviso: sinal nao reconhecido (%s); nada foi gravado.\n"
+           "Tente de novo com o controle a uns 30 cm a 1 m da placa.\n\n",
+           rec.warn_reason);
+    ui_record_failed();
+    break;
+
+  case IR_REC_POLL_DONE: {
+    int slot = ui_record_sequence(&seq);
+
+    if (slot < 0) {
+      break;
+    }
+    printk("Slot \"%s\" gravado com %d codigo(s)\n", ui_slot_name(slot),
+           seq.count);
+    if (suspect) {
+      printk("Aviso: um quadro perto deste toque falhou; a sequencia pode "
+             "estar incompleta.\nSe o aparelho nao reagir, grave de novo.\n");
+    }
+    int err = slot_store_save(ui_device(), slot, &seq);
+
+    if (err != 0) {
+      printk("Aviso: falha ao salvar na flash (%d); o slot vale ate "
+             "reiniciar\n", err);
+    }
+    printk("\n");
+    break;
+  }
+
+  case IR_REC_POLL_RAW: {
+    const struct ir_raw *raw = ir_rec_raw(&rec);
+
+    raw_done.n = raw->n;
+    memcpy(raw_done.d, raw->d, sizeof(raw->d[0]) * raw->n);
+    ir_rec_reset(&rec);
+
+    int slot = ui_record_raw(&raw_done);
+
+    if (slot < 0) {
+      printk("Gravacao crua nao salva (%d intervalos): sinal invalido ou "
+             "sem espaco (%d gravacoes cruas no maximo)\n\n", raw_done.n,
+             UI_RAW_SLOTS);
+      break;
+    }
+    printk("Slot \"%s\" gravado cru: %d intervalos (protocolo nao "
+           "reconhecido; reenvia os tempos como chegaram)\n",
+           ui_slot_name(slot), raw_done.n);
+    if (suspect) {
+      printk("Aviso: o toque passou de %d intervalos e foi cortado.\n",
+             IR_RAW_MAX);
+    }
+    int err = slot_store_save_raw(ui_device(), slot, &raw_done);
+
+    if (err != 0) {
+      printk("Aviso: falha ao salvar na flash (%d); o slot vale ate "
+             "reiniciar\n", err);
+    }
+    printk("\n");
+    break;
+  }
+
+  case IR_REC_POLL_NONE:
+    break;
+  }
+}
+
+static void on_slot_loaded(int dev, int slot, const struct ir_seq *seq) {
+  ui_restore_slot(dev, slot, seq);
+  printk("Flash: \"%s / %s\" gravado com %d codigo(s)\n",
+         ui_device_name(dev), ui_device_slot_name(dev, slot),
+         seq->count);
+}
+
+static void on_raw_loaded(int dev, int slot, const struct ir_raw *raw) {
+  ui_restore_raw(dev, slot, raw);
+  printk("Flash: \"%s / %s\" gravado cru (%d intervalos)\n",
+         ui_device_name(dev), ui_device_slot_name(dev, slot), raw->n);
+}
+
+static int saved_device;
+
+static void on_device_loaded(int dev) {
+  ui_set_device(dev);
+  saved_device = dev;
+}
+
+static const struct slot_store_cb store_cb = {
+    .num_devices = IR_LIB_NUM_DEVICES,
+    .max_slots = IR_LIB_MAX_SLOTS,
+    /* Os slots das versoes anteriores (um aparelho so) vao para "Livre". */
+    .legacy_device = IR_LIB_LIVRE,
+    .on_slot = on_slot_loaded,
+    .on_raw = on_raw_loaded,
+    .on_device = on_device_loaded,
+};
+
+/* Leva para a flash o que a interface mudou: aparelho escolhido e
+ * gravacoes apagadas. */
+static void sync_store(void) {
+  int dev, slot;
+
+  if (ui_device() != saved_device) {
+    saved_device = ui_device();
+    if (slot_store_save_device(saved_device) != 0) {
+      printk("Aviso: falha ao salvar o aparelho na flash\n");
+    }
+  }
+  if (ui_take_erased(&dev, &slot)) {
+    int err = slot_store_erase(dev, slot);
+
+    /* -ENOENT: a gravacao ainda nao tinha chegado a flash. */
+    if (err != 0 && err != -ENOENT) {
+      printk("Aviso: falha ao apagar da flash (%d)\n", err);
+    }
+    printk("\n");
   }
 }
 
@@ -278,17 +520,35 @@ int main(void) {
     return 0;
   }
   gpio_set_input_hysteresis_enabled(ir_pad_pin(), IR_HYSTERESIS);
+  ir_pin = ir_pad_pin();
+  cap.merge = k_us_to_cyc_ceil32(IR_EDGE_MERGE_US);
   gpio_init_callback(&ir_cb, on_edge, BIT(ir.pin));
   gpio_add_callback(ir.port, &ir_cb);
 
   if (ui_init() < 0) {
     printk("Display nao esta pronto; seguindo sem tela\n");
   }
+  int loaded = slot_store_init(&store_cb);
+
+  if (loaded < 0) {
+    printk("Flash: settings indisponivel (%d); gravacoes so na RAM\n",
+           loaded);
+  } else {
+    printk("Flash: %d gravacao(oes) carregada(s)\n", loaded);
+  }
+  printk("Aparelho: %s\n", ui_device_name(ui_device()));
   ui_draw();
 
   print_receiver_config();
+  if (IS_ENABLED(CONFIG_APP_IR_DEBUG)) {
+    printk("CONFIG_APP_IR_DEBUG ligada: toda captura e impressa\n");
+  }
   printk("Gire o encoder para escolher um slot. Clique envia; segure\n"
-         "0,8 s para gravar. BUTTON0..3 enviam os slots 1..4.\n\n");
+         "0,8 s para gravar. No nome do aparelho (acima do 1o slot), o\n"
+         "clique troca de aparelho. BUTTON0..3 enviam os slots 1..4.\n"
+         "Na lista: fb = codigo de fabrica, gr = gravado, -- = vazio.\n\n");
+
+  bool was_recording = false;
 
   while (1) {
     struct ui_event evt;
@@ -306,27 +566,30 @@ int main(void) {
       } while (k_msgq_get(&ui_msgq, &evt, K_NO_WAIT) == 0);
     }
     ui_tick();
-    ui_draw();
 
-    if (warn_pending &&
-        k_uptime_get_32() - warn_ms >= REPEAT_WINDOW_MS) {
-      warn_pending = false;
-      printk("Aviso: sinal nao reconhecido (%s); nada foi gravado.\n"
-             "Tente de novo com o controle a uns 30 cm a 1 m da placa.\n\n",
-             warn_reason);
-      ui_record_failed();
+    /* Entrar ou sair do modo gravar (inclusive cancelar) zera o
+     * gravador: nada de uma gravacao anterior vale depois. */
+    bool recording = ui_is_recording();
+
+    if (recording != was_recording) {
+      ir_rec_reset(&rec);
+      was_recording = recording;
     }
 
-    /* A captura sempre e retirada do buffer, mas so e decodificada no
-     * modo gravar. Fora dele, nada pendente de uma gravacao anterior
-     * (leitura sem confirmacao, aviso adiado) pode valer depois. */
+    /* A captura sempre e retirada do buffer; handle_capture so
+     * decodifica no modo gravar (ou com a depuracao ligada). O gravador
+     * e conferido depois, para um quadro que comecou dentro da janela
+     * entrar mesmo que o main o veja depois do prazo. */
     int n = take_capture(copy);
-    if (!ui_is_recording()) {
-      has_pending = false;
-      warn_pending = false;
-    } else if (n >= 2) {
+
+    if (n >= 2) {
       handle_capture(n);
     }
+    if (recording) {
+      poll_recorder();
+    }
+    sync_store();
+    ui_draw();
   }
   return 0;
 }

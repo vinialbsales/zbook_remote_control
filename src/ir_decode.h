@@ -21,13 +21,25 @@
 /* Quadro ideal: cabecalho (2) + 32 bits (64) + pulso final (1). */
 #define IR_FRAME_LEN 67
 
+/* Quadro do Coolix: cabecalho (2) + 48 bits (96) + pulso final (1). */
+#define IR_COOLIX_FRAME_LEN 99
+
 /* Maior sequencia que ir_encode gera (dois quadros e o intervalo). */
-#define IR_ENCODE_MAX (2 * IR_FRAME_LEN + 1)
+#define IR_ENCODE_MAX (2 * IR_COOLIX_FRAME_LEN + 1)
+
+/* Maior quadro que ir_encode_frame gera. */
+#define IR_ENCODE_FRAME_MAX IR_COOLIX_FRAME_LEN
 
 enum ir_protocol {
   IR_PROTO_NONE = 0,
   IR_PROTO_NEC,
   IR_PROTO_SAMSUNG32,
+  /* Ar-condicionado da familia Midea (Springer Midea, Carrier, Comfee,
+   * Beko, Toshiba...): 24 bits de estado, cada byte seguido do seu
+   * inverso. So envio: o decodificador nao conhece este protocolo (o
+   * cabecalho cai na tolerancia do Samsung32); gravacoes dele viram
+   * gravacoes cruas. */
+  IR_PROTO_COOLIX,
 };
 
 enum ir_status {
@@ -83,6 +95,16 @@ enum ir_status ir_decode(const uint32_t *dur, int n, struct ir_code *out,
  * quadro e um codigo de repeticao. Ambos a cada 108 ms.
  * Devolve o numero de duracoes escritas, ou 0 se nao couber. */
 int ir_encode(const struct ir_code *code, uint32_t *dur, int max);
+
+/* Monta um unico quadro ideal, sem repeticao. Usado para enviar
+ * sequencias de codigos diferentes (ex.: projetor Epson).
+ * Devolve o tamanho do quadro (IR_FRAME_LEN, ou IR_COOLIX_FRAME_LEN), ou
+ * 0 se nao couber ou o protocolo e desconhecido. */
+int ir_encode_frame(const struct ir_code *code, uint32_t *dur, int max);
+
+/* Duracao do quadro ideal, do inicio do cabecalho ao fim do pulso
+ * final, em us. 0 se o protocolo e desconhecido. */
+uint32_t ir_frame_duration_us(const struct ir_code *code);
 
 /* Valida o codigo de 32 bits segundo o protocolo. */
 int ir_code_is_valid(enum ir_protocol protocol, uint32_t code);

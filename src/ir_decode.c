@@ -1,4 +1,22 @@
-/* Decodificador de IR robusto para NEC e Samsung32. Ver ir_decode.h.
+/* Decodificador de IR hibrido para NEC, Samsung32 e Coolix. Ver
+ * ir_decode.h.
+ *
+ * Dois caminhos, nesta ordem (ir_decode_frame):
+ *
+ *   1. Convencional: confere cabecalho, cada pulso e cada espaco contra o
+ *      nominal (+-CONV_TOL_PCT %), com a estrutura exata do protocolo.
+ *      Rapido, iterativo e com pouca pilha. Le NEC, Samsung32, a
+ *      repeticao NEC e o Coolix (so este caminho le Coolix).
+ *   2. Robusto (reserva, CONFIG_APP_IR_ROBUST_FALLBACK): o modelo de
+ *      blocos descrito abaixo, so para NEC e Samsung32. Roda quando o
+ *      convencional nao le o quadro, com o mesmo comportamento de antes.
+ *
+ * Historico: o esticamento descrito abaixo NAO e uma caracteristica do
+ * receptor. A causa era um capacitor de 100 nF na linha do receptor, que
+ * nao devia estar ali. Sem ele (descoberto no laboratorio), o esticamento caiu
+ * para 0 a 20 us e os quadros saem pelo caminho convencional. O caminho
+ * robusto ficou como reserva para placas que ainda tenham o capacitor ou
+ * sinais muito fracos.
  *
  * Como o sinal e codificado (NEC e Samsung32 usam o mesmo esquema):
  *
@@ -7,7 +25,8 @@
  *   bit 1:     pulso 560 + espaco 1690  (periodo 2250)
  *   fim:       pulso 560
  *
- * O que o receptor da placa faz com isso: cada pulso chega esticado por
+ * O que o receptor com o capacitor fazia com isso (e o que o caminho
+ * robusto supoe): cada pulso chega esticado por
  * uma quantidade "e" (o esticamento) e o espaco seguinte encolhe na mesma
  * quantidade, de modo que pulso + espaco (o periodo) continua certo.
  * Quando e > 560, o espaco de um bit 0 deixa de existir e o pulso desse
@@ -41,6 +60,17 @@
 
 #include <stddef.h>
 
+/* Caminho robusto como reserva do convencional. Na placa vem do Kconfig
+ * (CONFIG_APP_IR_ROBUST_FALLBACK, que o Zephyr define em todo arquivo);
+ * no PC fica ligado, salvo -DIR_ROBUST_FALLBACK=0. */
+#ifndef IR_ROBUST_FALLBACK
+#if defined(__ZEPHYR__) && !defined(CONFIG_APP_IR_ROBUST_FALLBACK)
+#define IR_ROBUST_FALLBACK 0
+#else
+#define IR_ROBUST_FALLBACK 1
+#endif
+#endif
+
 /* Tempos nominais dos bits, em us. */
 #define BIT_PULSE 560
 #define BIT_SPACE_0 560
@@ -52,10 +82,10 @@
 /* Intervalo entre inicios de quadro dos controles NEC e Samsung. */
 #define REPEAT_PERIOD_US 108000
 
-/* Faixa de esticamento aceita nos bits. Medido: de -400 (sinal fraco)
- * ate ~1600 (pino com pull-up). O maximo fisico e um pouco menos que
- * 1690: acima disso ate o espaco do bit 1 some. Fora da faixa, a
- * hipotese e descartada. */
+/* Faixa de esticamento aceita nos bits. Medido com o capacitor: de -400
+ * (sinal fraco) ate ~1600 (pino com pull-up). O maximo fisico e um pouco
+ * menos que 1690: acima disso ate o espaco do bit 1 some. Fora da faixa,
+ * a hipotese e descartada. */
 #define STRETCH_MIN (-550)
 #define STRETCH_MAX 1650
 
@@ -263,6 +293,264 @@ static int check_bits(enum ir_protocol protocol, uint32_t code) {
   return 16;
 }
 
+/* ------------------------------------------------------------------ */
+/* Caminho convencional                                                */
+/* ------------------------------------------------------------------ */
+
+/* Tolerancia de cada intervalo, em % do nominal: pulso e espaco sao
+ * conferidos um a um, sem nenhuma suposicao de pulso perdido.
+ *
+ * Por que 30%:
+ *   - Receptores de 38 kHz alargam ou encurtam o pulso em alguns ciclos
+ *     da portadora (26 us cada); 30% de 560 = 168 us cobre ~6 ciclos, e
+ *     a placa sem o capacitor mede 0 a 20 us.
+ *   - Os espacos do bit 0 e do bit 1 continuam bem separados: 0 vai de
+ *     392 a 728 us e 1 de 1183 a 2197 us. Um espaco no meio (ex.: 1000)
+ *     nao e nem um nem outro e o quadro vai para o caminho robusto.
+ *   - Os pulsos esticados do receptor antigo (~850 us ou mais) ficam fora
+ *     de 392..728, entao esses quadros tambem vao para o robusto.
+ *   - Os cabecalhos continuam separados: 4500 (3150..5850) contra 9000
+ *     (6300..11700) no pulso; 4500 (3150..5850) contra 2250 da repeticao
+ *     (1575..2925) no espaco. */
+#define CONV_TOL_PCT 30
+
+/* Tempos de um protocolo no caminho convencional. */
+struct conv_timing {
+  enum ir_protocol protocol;
+  uint32_t header_pulse;
+  uint32_t header_space;
+  uint32_t bit_pulse;
+  uint32_t space_0;
+  uint32_t space_1;
+  int bits; /* bits de dados por quadro */
+};
+
+/* NEC e Samsung32 com os mesmos cabecalhos do timings[] do caminho
+ * robusto. Coolix com os tempos do put_coolix: 48 bits por quadro (cada
+ * byte do estado seguido do inverso). O cabecalho do Coolix (4692/4416)
+ * cai na tolerancia do Samsung32 (4500/4500); quem separa os dois e o
+ * numero de intervalos: 99 (ou 199, duas copias) contra 67. */
+static const struct conv_timing conv_timings[] = {
+    {IR_PROTO_SAMSUNG32, 4500, 4500, BIT_PULSE, BIT_SPACE_0, BIT_SPACE_1,
+     FRAME_BITS},
+    {IR_PROTO_NEC, 9000, 4500, BIT_PULSE, BIT_SPACE_0, BIT_SPACE_1,
+     FRAME_BITS},
+    {IR_PROTO_COOLIX, COOLIX_HDR_PULSE, COOLIX_HDR_SPACE, COOLIX_BIT_PULSE,
+     COOLIX_SPACE_0, COOLIX_SPACE_1, 2 * COOLIX_BITS},
+};
+
+/* Intervalo entre as duas copias do Coolix. Sai do ir_encode com
+ * COOLIX_GAP (5244 us); acima de IR_FRAME_GAP_US, as copias ja chegam
+ * como quadros separados e cada uma e lida sozinha. */
+#define COOLIX_GAP_MIN (COOLIX_GAP * (100 - CONV_TOL_PCT) / 100)
+
+/* Estado Coolix de 48 bits lidos: cada byte tem que vir seguido do seu
+ * inverso. Devolve 0 se algum inverso nao bate. */
+static int coolix_state(uint64_t bits, uint32_t *state) {
+  uint32_t v = 0;
+
+  for (int byte = 2; byte >= 0; byte--) {
+    uint8_t b = (uint8_t)(bits >> (16 * byte + 8));
+    uint8_t inv = (uint8_t)(bits >> (16 * byte));
+
+    if (inv != (uint8_t)~b) {
+      return 0;
+    }
+    v = v << 8 | b;
+  }
+  *state = v;
+  return 1;
+}
+
+/* Esticamento de cada bit, calculado como no caminho robusto (espaco
+ * nominal - espaco medido; no pulso final, pulso medido - nominal), para
+ * o log mostrar a mesma coisa nos dois caminhos. */
+struct conv_stats {
+  int32_t sum;
+  int32_t min;
+  int32_t max;
+  int count;
+};
+
+static void conv_stats_add(struct conv_stats *st, int32_t s) {
+  if (st->count == 0 || s < st->min) {
+    st->min = s;
+  }
+  if (st->count == 0 || s > st->max) {
+    st->max = s;
+  }
+  st->sum += s;
+  st->count++;
+}
+
+/* v dentro de nominal +- CONV_TOL_PCT %. Em 64 bits: um pulso preso pode
+ * durar segundos. */
+static int conv_near(uint32_t v, uint32_t nominal) {
+  uint64_t v100 = (uint64_t)v * 100;
+
+  return v100 >= (uint64_t)nominal * (100 - CONV_TOL_PCT) &&
+         v100 <= (uint64_t)nominal * (100 + CONV_TOL_PCT);
+}
+
+/* Le um quadro de t->bits bits que comeca em d[0] (cabecalho) e tem
+ * exatamente 2 + 2 * bits + 1 intervalos. Os bits saem em *bits, o
+ * primeiro que chegou no mais significativo. */
+static enum ir_status conv_read_frame(const struct conv_timing *t,
+                                      const uint32_t *d, uint64_t *bits,
+                                      struct conv_stats *st) {
+  uint64_t v = 0;
+
+  if (!conv_near(d[0], t->header_pulse) || !conv_near(d[1], t->header_space)) {
+    return IR_ERR_HEADER;
+  }
+  for (int i = 0; i < t->bits; i++) {
+    uint32_t pulse = d[2 + 2 * i];
+    uint32_t space = d[3 + 2 * i];
+    int bit;
+
+    if (!conv_near(pulse, t->bit_pulse)) {
+      return IR_ERR_DECODE;
+    }
+    if (conv_near(space, t->space_1)) {
+      bit = 1;
+    } else if (conv_near(space, t->space_0)) {
+      bit = 0;
+    } else {
+      return IR_ERR_DECODE;
+    }
+    conv_stats_add(st, (int32_t)(bit ? t->space_1 : t->space_0) -
+                           (int32_t)space);
+    v = v << 1 | (uint64_t)bit;
+  }
+  uint32_t final_pulse = d[2 + 2 * t->bits];
+
+  if (!conv_near(final_pulse, t->bit_pulse)) {
+    return IR_ERR_DECODE;
+  }
+  conv_stats_add(st, (int32_t)final_pulse - (int32_t)t->bit_pulse);
+  *bits = v;
+  return IR_OK;
+}
+
+/* Le os bits de um quadro e valida: NEC e Samsung32 pelo
+ * ir_code_is_valid; Coolix pelos bytes inversos e pelo ir_code_is_valid
+ * (nibble 0xB). */
+static enum ir_status conv_frame_code(const struct conv_timing *t,
+                                      const uint32_t *d, uint32_t *code,
+                                      struct conv_stats *st) {
+  uint64_t bits;
+  enum ir_status res = conv_read_frame(t, d, &bits, st);
+
+  if (res != IR_OK) {
+    return res;
+  }
+  if (t->protocol == IR_PROTO_COOLIX) {
+    if (!coolix_state(bits, code)) {
+      return IR_ERR_CHECK;
+    }
+  } else {
+    *code = (uint32_t)bits;
+  }
+  return ir_code_is_valid(t->protocol, *code) ? IR_OK : IR_ERR_CHECK;
+}
+
+/* Decodificador convencional: cabecalho e bits conferidos intervalo a
+ * intervalo, com a estrutura exata do protocolo (cabecalho + bits +
+ * pulso final). Sem busca e sem recursao. Para NEC e Samsung32, aplica a
+ * mesma validacao do caminho robusto (ir_code_is_valid). O check_bits do
+ * robusto so pesa em leituras com pulso perdido, que este caminho nunca
+ * supoe.
+ *
+ * Coolix: o controle manda o quadro duas vezes com ~5,2 ms entre elas, o
+ * que fica abaixo de IR_FRAME_GAP_US, entao as duas copias chegam num
+ * quadro so de 199 intervalos. As duas tem que dar o mesmo estado. Um
+ * quadro de 99 (uma copia) tambem vale. */
+static enum ir_status decode_conventional(const uint32_t *dur, int n,
+                                          struct ir_code *out,
+                                          struct ir_decode_info *info) {
+  const struct conv_timing *t = NULL;
+  int header_seen = 0;
+
+  if (n < 2) {
+    return IR_ERR_HEADER;
+  }
+
+  /* NEC repetido: so cabecalho curto e o pulso final. */
+  if (n == 3 && conv_near(dur[0], NEC_REPEAT_PULSE) &&
+      conv_near(dur[1], NEC_REPEAT_SPACE) && conv_near(dur[2], BIT_PULSE)) {
+    return IR_REPEAT;
+  }
+
+  /* O protocolo e escolhido pelo cabecalho e pelo numero de intervalos. */
+  for (size_t p = 0; p < sizeof(conv_timings) / sizeof(conv_timings[0]);
+       p++) {
+    const struct conv_timing *c = &conv_timings[p];
+
+    if (!conv_near(dur[0], c->header_pulse) ||
+        !conv_near(dur[1], c->header_space)) {
+      continue;
+    }
+    header_seen = 1;
+    int len = 2 + 2 * c->bits + 1;
+
+    if (n == len ||
+        (c->protocol == IR_PROTO_COOLIX && n == 2 * len + 1)) {
+      t = c;
+      break;
+    }
+  }
+  if (!header_seen) {
+    return IR_ERR_HEADER;
+  }
+  if (n % 2 == 0) {
+    return IR_ERR_TRUNCATED;
+  }
+  if (t == NULL) {
+    return IR_ERR_DECODE; /* cabecalho conhecido, tamanho errado */
+  }
+
+  struct conv_stats st = {0};
+  uint32_t code;
+  int len = 2 + 2 * t->bits + 1;
+  enum ir_status res = conv_frame_code(t, dur, &code, &st);
+
+  if (res != IR_OK) {
+    return res;
+  }
+  if (n > len) {
+    /* Segunda copia do Coolix. */
+    uint32_t again;
+
+    if (dur[len] < COOLIX_GAP_MIN || dur[len] > IR_FRAME_GAP_US) {
+      return IR_ERR_DECODE;
+    }
+    res = conv_frame_code(t, dur + len + 1, &again, &st);
+    if (res != IR_OK) {
+      return res;
+    }
+    if (again != code) {
+      return IR_ERR_AMBIGUOUS;
+    }
+  }
+
+  out->protocol = t->protocol;
+  out->code = code;
+  if (info != NULL) {
+    info->stretch_avg_us = st.sum / st.count;
+    info->stretch_min_us = st.min;
+    info->stretch_max_us = st.max;
+    info->lost_pulses = 0;
+    info->candidates = 1;
+    info->search_steps = 0;
+    info->path = IR_PATH_CONVENTIONAL;
+  }
+  return IR_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Caminho robusto                                                     */
+/* ------------------------------------------------------------------ */
+
 /* Chamado quando todos os blocos receberam uma leitura: monta os bits,
  * confere o pulso final e a validacao, e compara com o melhor ate agora. */
 static void evaluate(struct search *sr, int n_bits, int32_t last_s,
@@ -365,9 +653,11 @@ static void explore(struct search *sr, int i, int n_bits, int32_t last_s,
   }
 }
 
-enum ir_status ir_decode_frame(const uint32_t *dur, int n,
-                               struct ir_code *out,
-                               struct ir_decode_info *info) {
+/* Decodificador robusto (blocos, esticamento e busca). Comportamento
+ * igual ao de antes do caminho convencional. */
+static enum ir_status decode_robust(const uint32_t *dur, int n,
+                                    struct ir_code *out,
+                                    struct ir_decode_info *info) {
   struct search sr = {0};
   struct block blocks[MAX_BLOCKS];
 
@@ -435,8 +725,22 @@ enum ir_status ir_decode_frame(const uint32_t *dur, int n,
     *info = sr.best_info;
     info->candidates = sr.candidates;
     info->search_steps = sr.nodes;
+    info->path = IR_PATH_ROBUST;
   }
   return IR_OK;
+}
+
+/* Primeiro o caminho convencional; se ele nao ler o quadro, o robusto
+ * (se ligado), sem nenhuma mudanca no comportamento dele. */
+enum ir_status ir_decode_frame(const uint32_t *dur, int n,
+                               struct ir_code *out,
+                               struct ir_decode_info *info) {
+  enum ir_status st = decode_conventional(dur, n, out, info);
+
+  if (st == IR_OK || st == IR_REPEAT || !IR_ROBUST_FALLBACK) {
+    return st;
+  }
+  return decode_robust(dur, n, out, info);
 }
 
 int ir_split_frames(const uint32_t *dur, int n, struct ir_span *spans,

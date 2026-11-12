@@ -1,14 +1,18 @@
-/* Decodificador de IR robusto para NEC e Samsung32.
+/* Decodificador de IR hibrido para NEC, Samsung32 e Coolix.
  *
  * C puro, sem dependencias do Zephyr: compila no PC (testes) e na placa.
  *
  * Entrada: duracoes em microssegundos, alternando pulso (portadora
  * ligada), espaco, pulso... sempre comecando por um pulso.
  *
- * O receptor da placa estica os pulsos e encurta os espacos por uma
- * quantidade variavel (o "esticamento"), mas preserva o periodo entre o
- * inicio de um pulso e o inicio do seguinte. O decodificador usa esse
- * periodo, e nao a largura do pulso, para contar os bits.
+ * Primeiro tenta o caminho convencional (cada tempo conferido contra o
+ * nominal), que le o sinal limpo do receptor. Se ele nao ler o quadro, o
+ * caminho robusto (reserva, CONFIG_APP_IR_ROBUST_FALLBACK) le NEC e
+ * Samsung32 mesmo com os pulsos esticados e os espacos encurtados por uma
+ * quantidade variavel (o "esticamento"), usando o periodo entre o inicio
+ * de um pulso e o inicio do seguinte, que se preserva. O esticamento era
+ * causado por um capacitor de 100 nF na linha do receptor, ja removido;
+ * sem ele, fica entre 0 e 20 us. Detalhes em ir_decode.c.
  */
 #ifndef IR_DECODE_H
 #define IR_DECODE_H
@@ -36,9 +40,12 @@ enum ir_protocol {
   IR_PROTO_SAMSUNG32,
   /* Ar-condicionado da familia Midea (Springer Midea, Carrier, Comfee,
    * Beko, Toshiba...): 24 bits de estado, cada byte seguido do seu
-   * inverso. So envio: o decodificador nao conhece este protocolo (o
-   * cabecalho cai na tolerancia do Samsung32); gravacoes dele viram
-   * gravacoes cruas. */
+   * inverso. Envio e gravacao: so o caminho convencional le este
+   * protocolo (o cabecalho cai na tolerancia do Samsung32; quem separa e
+   * o numero de intervalos, 99 ou 199 contra 67). Gravacoes viram uma
+   * sequencia normal de um codigo, igual a da biblioteca. Com o sinal
+   * distorcido (receptor com o capacitor), o convencional nao le e a
+   * gravacao continua crua. */
   IR_PROTO_COOLIX,
 };
 
@@ -59,7 +66,15 @@ struct ir_code {
   uint32_t code;
 };
 
-/* Informacoes extras de uma decodificacao bem sucedida. */
+/* Caminho do decodificador que leu o quadro (ver ir_decode.c). */
+enum ir_decode_path {
+  IR_PATH_NONE = 0,
+  IR_PATH_CONVENTIONAL, /* tempos conferidos um a um, sinal limpo */
+  IR_PATH_ROBUST,       /* blocos e busca, sinal distorcido */
+};
+
+/* Informacoes extras de uma decodificacao bem sucedida. No caminho
+ * convencional, lost_pulses = 0, candidates = 1 e search_steps = 0. */
 struct ir_decode_info {
   int32_t stretch_avg_us; /* esticamento medio estimado no quadro */
   int32_t stretch_min_us;
@@ -67,6 +82,7 @@ struct ir_decode_info {
   int lost_pulses;  /* pulsos que a leitura escolhida supoe perdidos */
   int candidates;   /* leituras com 32 bits examinadas */
   int search_steps; /* passos da busca (mede o custo da decodificacao) */
+  enum ir_decode_path path;
 };
 
 /* Trecho [start, start + len) de um vetor de duracoes. */
@@ -80,7 +96,8 @@ struct ir_span {
 int ir_split_frames(const uint32_t *dur, int n, struct ir_span *spans,
                     int max);
 
-/* Decodifica um unico quadro. info pode ser NULL. */
+/* Decodifica um unico quadro: caminho convencional e, se ele nao ler,
+ * o robusto (se ligado). info pode ser NULL; info->path diz qual leu. */
 enum ir_status ir_decode_frame(const uint32_t *dur, int n,
                                struct ir_code *out,
                                struct ir_decode_info *info);

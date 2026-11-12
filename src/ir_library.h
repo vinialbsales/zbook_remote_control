@@ -134,7 +134,9 @@ static const struct ir_lib_device ir_lib_devices[IR_LIB_NUM_DEVICES] = {
      *
      * Atencao: alguns Midea usam outro protocolo (Midea de 48 bits,
      * controles RG57A/RG57H/RG66/RG10). Se estes nao funcionarem, grave
-     * por cima (vira gravacao crua). */
+     * por cima: um controle Coolix e lido pelo caminho convencional do
+     * decodificador e vira um codigo Coolix comum; um de outro protocolo
+     * vira gravacao crua. */
     [IR_LIB_AR_MIDEA] =
         {
             .name = "Ar Midea",

@@ -290,7 +290,9 @@ static void debug_capture(int n_edges_copied, int n, const struct frame_result *
              ir_protocol_name(r->code.protocol), r->code.code,
              r->info.stretch_avg_us, r->info.stretch_min_us,
              r->info.stretch_max_us, r->info.lost_pulses);
-      printk(", %d passos", r->info.search_steps);
+      printk(", %d passos, caminho %s", r->info.search_steps,
+             r->info.path == IR_PATH_CONVENTIONAL ? "convencional"
+                                                  : "robusto");
     } else {
       printk("%s", ir_status_name(r->status));
     }

@@ -14,4 +14,16 @@ config APP_IR_DEBUG
 	  captura tipica e ate ~130 ms numa de 200 bordas. Desligada, o
 	  codigo nao vai para o binario.
 
+config APP_IR_ROBUST_FALLBACK
+	bool "Decodificador IR robusto como reserva do convencional"
+	default y
+	help
+	  O decodificador tenta primeiro o caminho convencional (tempos
+	  conferidos um a um, para o sinal limpo do receptor sem o
+	  capacitor de 100 nF). Com esta opcao, um quadro que ele nao le
+	  vai para o caminho robusto (blocos, esticamento e busca), feito
+	  para o sinal distorcido. Desligada, so o convencional roda; serve
+	  para comparar os dois sem mexer no codigo. A busca do robusto
+	  precisa de CONFIG_MAIN_STACK_SIZE=8192.
+
 source "Kconfig.zephyr"

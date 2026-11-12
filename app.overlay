@@ -18,7 +18,13 @@
 };
 
 /* Configuracao do pino do receptor (GPIO47). Variacoes testadas na
- * Parte A: sem pull, GPIO_PULL_UP e GPIO_PULL_DOWN. */
+ * Parte A (docs/DEVLOG.md): sem pull, GPIO_PULL_UP e GPIO_PULL_DOWN. O
+ * pull-down ficou porque dava o menor esticamento dos pulsos (~850 us).
+ * Esse esticamento nao era do receptor: vinha de um capacitor de 100 nF
+ * na linha, que nao devia estar ali. Sem o capacitor, fica entre 0 e
+ * 20 us e o decodificador usa o caminho convencional; o caminho robusto
+ * ficou como reserva. O pull-down foi mantido (nao foi medido de novo
+ * sem o capacitor). */
 &ir_receiver {
 	gpios = <&gpio0_hi 15 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 };
@@ -29,7 +35,9 @@
 	 * do RP2350), 0 desliga. O driver GPIO do Zephyr nao tem flag para
 	 * isso, entao o main.c aplica o valor pelo Pico SDK. Desligada, a
 	 * borda lenta do receptor gera bordas espurias e nenhum toque foi
-	 * capturado; por isso fica ligada. */
+	 * capturado; por isso fica ligada. (Medido com o capacitor de
+	 * 100 nF na linha, que provavelmente deixava a borda lenta; sem ele,
+	 * nao foi testado de novo.) */
 	zephyr,user {
 		ir-hysteresis = <1>;
 	};
